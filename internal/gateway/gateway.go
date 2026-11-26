@@ -73,6 +73,8 @@ func (e *upstreamCallError) Error() string {
 func (g *Gateway) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/models", g.handleListOpenAIModels)
 	mux.HandleFunc("POST /v1/chat/completions", g.handleChatCompletions)
+	mux.HandleFunc("POST /v1/audio/transcriptions", g.handleAudioTranscriptions)
+	mux.HandleFunc("POST /v1/rerank", g.handleRerank)
 	mux.HandleFunc("POST /v1/messages", g.handleAnthropicMessages)
 	mux.HandleFunc("GET /v1/usage", g.handleGetUsage)
 	mux.HandleFunc("GET /v1/local-providers", g.handleListLocalProviders)

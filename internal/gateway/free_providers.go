@@ -10,6 +10,7 @@ const (
 	GroqProviderName       = "groq-lpu-free"
 	OpenRouterProviderName = "openrouter-free"
 	NvidiaProviderName     = "nvidia-nim-free"
+	MistralProviderName    = "mistral-experiment-free"
 
 	DefaultGroqBaseURL       = "https://api.groq.com/openai/v1"
 	DefaultOpenRouterBaseURL = "https://openrouter.ai/api/v1"
@@ -18,6 +19,8 @@ const (
 	DefaultGroqModel       = "llama-3.3-70b-versatile"
 	DefaultOpenRouterModel = "openrouter/free"
 	DefaultNvidiaModel     = "meta/llama-3.3-70b-instruct"
+	DefaultMistralBaseURL  = "https://api.mistral.ai/v1"
+	DefaultMistralModel    = "mistral-small-latest"
 )
 
 // FreeProvidersConfig configures optional zero-credit-card fallback providers.
@@ -28,6 +31,8 @@ type FreeProvidersConfig struct {
 	OpenRouterBaseURL string
 	NvidiaAPIKey      string
 	NvidiaBaseURL     string
+	MistralAPIKey     string
+	MistralBaseURL    string
 }
 
 // FreeProvidersConfigFromEnv reads Groq, OpenRouter, and NVIDIA NIM keys/URLs.
@@ -47,6 +52,8 @@ func FreeProvidersConfigFromEnv(lookup func(string) string) FreeProvidersConfig 
 		OpenRouterBaseURL: pick("OPENROUTER_BASE_URL"),
 		NvidiaAPIKey:      pick("NVIDIA_API_KEY", "NVIDIA_NIM_API_KEY"),
 		NvidiaBaseURL:     pick("NVIDIA_BASE_URL", "NVIDIA_NIM_BASE_URL"),
+		MistralAPIKey:     pick("MISTRAL_API_KEY"),
+		MistralBaseURL:    pick("MISTRAL_BASE_URL"),
 	}
 }
 
@@ -99,6 +106,14 @@ func (g *Gateway) ConfigureFreeProviders(ctx context.Context, cfg FreeProvidersC
 			DefaultModel: DefaultNvidiaModel,
 			Models:       []string{DefaultNvidiaModel, "nvidia/llama-3.1-nemotron-70b-instruct"},
 			Priority:     80,
+		},
+		{
+			Name:         MistralProviderName,
+			BaseURL:      normalizeOpenAIBase(cfg.MistralBaseURL, DefaultMistralBaseURL),
+			APIKey:       strings.TrimSpace(cfg.MistralAPIKey),
+			DefaultModel: DefaultMistralModel,
+			Models:       []string{DefaultMistralModel, "open-mistral-nemo"},
+			Priority:     85,
 		},
 	}
 
