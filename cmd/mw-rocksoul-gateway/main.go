@@ -135,6 +135,21 @@ func main() {
 	}
 	defer func() { _ = gw.Close() }()
 
+	geminiEnabled, geminiErr := gw.ConfigureGemini(context.Background(), gateway.GeminiConfigFromEnv(os.Getenv))
+	if geminiErr != nil {
+		log.Fatalf("[%s] configure google ai studio: %v", serviceName, geminiErr)
+	}
+	if geminiEnabled {
+		log.Printf("[%s] google ai studio (gemini free tier) enabled", serviceName)
+	}
+	freeRegistered, freeErr := gw.ConfigureFreeProviders(context.Background(), gateway.FreeProvidersConfigFromEnv(os.Getenv))
+	if freeErr != nil {
+		log.Fatalf("[%s] configure free fallback providers: %v", serviceName, freeErr)
+	}
+	if len(freeRegistered) > 0 {
+		log.Printf("[%s] free fallback providers enabled: %s", serviceName, strings.Join(freeRegistered, ", "))
+	}
+
 	var verifier *auth.RIDVerifier
 	if cfg.AuthMode != "disabled" {
 		verifier, err = auth.NewRIDVerifier(auth.RIDConfig{
