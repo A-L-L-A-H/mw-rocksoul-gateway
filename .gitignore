@@ -13,5 +13,6 @@ data/
 # Env & coverage
 .env
 .env.*
+!.env.example
 coverage.out
 coverage.html

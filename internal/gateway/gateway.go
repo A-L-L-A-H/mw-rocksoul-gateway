@@ -59,6 +59,7 @@ type upstreamCallError struct {
 	Body       string
 	Retryable  bool
 	Cooldown   bool
+	RetryAfter time.Duration
 }
 
 func (e *upstreamCallError) Error() string {
@@ -80,6 +81,7 @@ func (g *Gateway) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/local-providers", g.handleListLocalProviders)
 
 	mux.HandleFunc("GET /api/ai/stats", g.handleGetStats)
+	mux.HandleFunc("GET /api/ai/quotas", g.handleListQuotas)
 	mux.HandleFunc("GET /api/ai/providers", g.handleListProviders)
 	mux.HandleFunc("POST /api/ai/providers", g.handleCreateProvider)
 	mux.HandleFunc("DELETE /api/ai/providers/{id}", g.handleDeleteProvider)
@@ -308,7 +310,7 @@ FROM ai_providers`
 	}
 	defer func() { _ = rows.Close() }()
 
-	now := time.Now().UTC()
+	now := g.now()
 	providers := make([]storedProvider, 0)
 	for rows.Next() {
 		var record storedProvider
@@ -879,7 +881,7 @@ func (g *Gateway) routeCompletion(
 			lastCallErr = callErr
 			var upErr *upstreamCallError
 			if errors.As(callErr, &upErr) {
-				g.recordProviderError(ctx, candidate.ID, upErr.Cooldown)
+				g.recordProviderError(ctx, candidate.ID, upErr.Cooldown, upErr.RetryAfter)
 				if upErr.Retryable {
 					continue
 				}
@@ -996,6 +998,7 @@ func (g *Gateway) selectCandidateProviders(
 	}
 
 	healthy := make([]storedProvider, 0, len(enabledProviders))
+	seenLoopbackBase := make(map[string]bool)
 	for _, provider := range enabledProviders {
 		if provider.InCooldown {
 			continue
@@ -1003,40 +1006,15 @@ func (g *Gateway) selectCandidateProviders(
 		if classification == ClassificationLocalOnly && !localai.IsLoopbackEndpointURL(provider.BaseURL) {
 			continue
 		}
-		healthy = append(healthy, provider)
-	}
-
-	// If local_only has no explicitly registered loopback DB providers and a
-	// local discoverer is configured, synthesize candidates from live loopback runtimes.
-	if classification == ClassificationLocalOnly && len(healthy) == 0 && g.localDiscovery != nil {
-		discovered := g.localDiscovery.Discover(ctx)
-		for _, status := range discovered.Providers {
-			if !status.Online || !localai.IsLoopbackEndpointURL(status.OpenAIBaseURL) {
+		if g.quotas != nil {
+			if allowed, _ := g.quotas.Allow(provider.Provider, 0); !allowed {
 				continue
 			}
-			modelIDs := make([]string, 0, len(status.Models))
-			for _, m := range status.Models {
-				modelIDs = append(modelIDs, m.ID)
-			}
-			defaultModel := ""
-			if len(modelIDs) > 0 {
-				defaultModel = modelIDs[0]
-			}
-			healthy = append(healthy, storedProvider{
-				Provider: Provider{
-					ID:           "local_" + status.ID,
-					Name:         "local-" + status.ID,
-					Kind:         KindOpenAICompat,
-					Tier:         TierFree,
-					BaseURL:      status.OpenAIBaseURL,
-					IsLocal:      true,
-					DefaultModel: defaultModel,
-					Models:       modelIDs,
-					Priority:     1000,
-					Enabled:      true,
-				},
-			})
 		}
+		if provider.IsLocal {
+			seenLoopbackBase[strings.TrimRight(strings.ToLower(provider.BaseURL), "/")] = true
+		}
+		healthy = append(healthy, provider)
 	}
 
 	modelSpecific := effectiveModel != "" && !strings.EqualFold(effectiveModel, "auto")
@@ -1056,6 +1034,54 @@ func (g *Gateway) selectCandidateProviders(
 		}
 		return healthy[i].CreatedAt < healthy[j].CreatedAt
 	})
+
+	// Automatic local Ollama / loopback failover:
+	// - For local_only, synthesize discovered local runtimes when no loopback DB provider is healthy.
+	// - For cloud_eligible, append discovered online local runtimes (Ollama first) at the tail of
+	//   candidates so quota exhaustion, cooldowns, or mid-request 429/5xx automatically fail over to local Ollama.
+	if g.localDiscovery != nil && (classification != ClassificationLocalOnly || len(healthy) == 0) {
+		discovered := g.localDiscovery.Discover(ctx)
+		localCandidates := make([]storedProvider, 0, len(discovered.Providers))
+		for _, status := range discovered.Providers {
+			if !status.Online || !localai.IsLoopbackEndpointURL(status.OpenAIBaseURL) {
+				continue
+			}
+			normBase := strings.TrimRight(strings.ToLower(status.OpenAIBaseURL), "/")
+			if seenLoopbackBase[normBase] {
+				continue
+			}
+			modelIDs := make([]string, 0, len(status.Models))
+			for _, m := range status.Models {
+				modelIDs = append(modelIDs, m.ID)
+			}
+			defaultModel := ""
+			if len(modelIDs) > 0 {
+				defaultModel = modelIDs[0]
+			}
+			prio := 10000
+			if strings.EqualFold(status.ID, "ollama") || strings.EqualFold(status.Kind, "ollama") {
+				prio = 9000
+			}
+			localCandidates = append(localCandidates, storedProvider{
+				Provider: Provider{
+					ID:           "local_" + status.ID,
+					Name:         "local-" + status.ID,
+					Kind:         KindOpenAICompat,
+					Tier:         TierFree,
+					BaseURL:      status.OpenAIBaseURL,
+					IsLocal:      true,
+					DefaultModel: defaultModel,
+					Models:       modelIDs,
+					Priority:     prio,
+					Enabled:      true,
+				},
+			})
+		}
+		sort.SliceStable(localCandidates, func(i, j int) bool {
+			return localCandidates[i].Priority < localCandidates[j].Priority
+		})
+		healthy = append(healthy, localCandidates...)
+	}
 
 	return healthy, nil
 }
@@ -1169,6 +1195,7 @@ func (g *Gateway) dispatchOpenAICompatUpstream(
 			Body:       string(respBytes),
 			Retryable:  true,
 			Cooldown:   true,
+			RetryAfter: ParseRetryAfterHeader(httpResp.Header.Get("Retry-After"), g.now()),
 		}
 	}
 	if httpResp.StatusCode >= 500 || httpResp.StatusCode == http.StatusUnauthorized || httpResp.StatusCode == http.StatusForbidden {
@@ -1240,7 +1267,13 @@ func (g *Gateway) dispatchAnthropicUpstream(
 		return nil, ChatCompletionResponse{}, &upstreamCallError{StatusCode: http.StatusBadGateway, Body: readErr.Error(), Retryable: true}
 	}
 	if httpResp.StatusCode == http.StatusTooManyRequests {
-		return nil, ChatCompletionResponse{}, &upstreamCallError{StatusCode: httpResp.StatusCode, Body: string(respBytes), Retryable: true, Cooldown: true}
+		return nil, ChatCompletionResponse{}, &upstreamCallError{
+			StatusCode: httpResp.StatusCode,
+			Body:       string(respBytes),
+			Retryable:  true,
+			Cooldown:   true,
+			RetryAfter: ParseRetryAfterHeader(httpResp.Header.Get("Retry-After"), g.now()),
+		}
 	}
 	if httpResp.StatusCode >= 500 || httpResp.StatusCode == http.StatusUnauthorized || httpResp.StatusCode == http.StatusForbidden {
 		return nil, ChatCompletionResponse{}, &upstreamCallError{StatusCode: httpResp.StatusCode, Body: string(respBytes), Retryable: true}
@@ -1312,7 +1345,13 @@ func (g *Gateway) dispatchGeminiNativeUpstream(
 		return nil, ChatCompletionResponse{}, &upstreamCallError{StatusCode: http.StatusBadGateway, Body: readErr.Error(), Retryable: true}
 	}
 	if httpResp.StatusCode == http.StatusTooManyRequests {
-		return nil, ChatCompletionResponse{}, &upstreamCallError{StatusCode: httpResp.StatusCode, Body: string(respBytes), Retryable: true, Cooldown: true}
+		return nil, ChatCompletionResponse{}, &upstreamCallError{
+			StatusCode: httpResp.StatusCode,
+			Body:       string(respBytes),
+			Retryable:  true,
+			Cooldown:   true,
+			RetryAfter: ParseRetryAfterHeader(httpResp.Header.Get("Retry-After"), g.now()),
+		}
 	}
 	if httpResp.StatusCode >= 500 || httpResp.StatusCode == http.StatusUnauthorized || httpResp.StatusCode == http.StatusForbidden {
 		return nil, ChatCompletionResponse{}, &upstreamCallError{StatusCode: httpResp.StatusCode, Body: string(respBytes), Retryable: true}
@@ -1434,12 +1473,20 @@ ON CONFLICT(cache_key) DO UPDATE SET
 	)
 }
 
-func (g *Gateway) recordProviderError(ctx context.Context, providerID string, setCooldown bool) {
+func (g *Gateway) recordProviderError(ctx context.Context, providerID string, setCooldown bool, retryAfter ...time.Duration) {
 	if strings.HasPrefix(providerID, "local_") {
 		return
 	}
 	if setCooldown {
-		until := time.Now().UTC().Add(defaultCooldownDuration).Format(time.RFC3339)
+		var ra time.Duration
+		if len(retryAfter) > 0 {
+			ra = retryAfter[0]
+		}
+		cooldownDur := defaultCooldownDuration
+		if g.quotas != nil {
+			cooldownDur = g.quotas.RecordFailureAndComputeCooldown(providerID, ra)
+		}
+		until := g.now().Add(cooldownDur).Format(time.RFC3339)
 		_, _ = g.db.ExecContext(ctx, `
 UPDATE ai_providers SET err_count = err_count + 1, cooldown_until = ? WHERE id = ?`, until, providerID)
 		return
@@ -1448,6 +1495,9 @@ UPDATE ai_providers SET err_count = err_count + 1, cooldown_until = ? WHERE id =
 }
 
 func (g *Gateway) recordProviderSuccess(ctx context.Context, providerID string, promptTokens, completionTokens int) {
+	if g.quotas != nil {
+		g.quotas.RecordSuccess(providerID, promptTokens, completionTokens)
+	}
 	if strings.HasPrefix(providerID, "local_") {
 		return
 	}
@@ -1975,8 +2025,9 @@ func (g *Gateway) handleStreamingChatCompletion(
 		if httpResp.StatusCode == http.StatusTooManyRequests {
 			bodyBytes, _ := io.ReadAll(io.LimitReader(httpResp.Body, 64*1024))
 			_ = httpResp.Body.Close()
-			lastErr = &upstreamCallError{StatusCode: httpResp.StatusCode, Body: string(bodyBytes), Retryable: true, Cooldown: true}
-			g.recordProviderError(ctx, candidate.ID, true)
+			ra := ParseRetryAfterHeader(httpResp.Header.Get("Retry-After"), g.now())
+			lastErr = &upstreamCallError{StatusCode: httpResp.StatusCode, Body: string(bodyBytes), Retryable: true, Cooldown: true, RetryAfter: ra}
+			g.recordProviderError(ctx, candidate.ID, true, ra)
 			continue
 		}
 		if httpResp.StatusCode >= 500 || httpResp.StatusCode == http.StatusUnauthorized || httpResp.StatusCode == http.StatusForbidden {

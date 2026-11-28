@@ -78,6 +78,7 @@ type Options struct {
 	LoopbackHTTPClient    *http.Client
 	GitHubAPIBase         string
 	RawBase               string
+	Clock                 func() time.Time
 }
 
 // Gateway implements the sovereign AI routing gateway combining multi-provider
@@ -92,6 +93,8 @@ type Gateway struct {
 	loopbackClient        *http.Client
 	defaultClassification DataClassification
 	localDiscovery        *localai.Discoverer
+	clock                 func() time.Time
+	quotas                *QuotaTracker
 
 	GitHubAPIBase string
 	RawBase       string
@@ -434,6 +437,11 @@ func Open(opts Options) (*Gateway, error) {
 		rawBase = DefaultRawBase
 	}
 
+	clockFn := opts.Clock
+	if clockFn == nil {
+		clockFn = func() time.Time { return time.Now().UTC() }
+	}
+
 	gw := &Gateway{
 		db:                    db,
 		dataDir:               cleanDir,
@@ -442,6 +450,8 @@ func Open(opts Options) (*Gateway, error) {
 		loopbackClient:        loopbackClient,
 		defaultClassification: defaultClass,
 		localDiscovery:        opts.LocalDiscovery,
+		clock:                 clockFn,
+		quotas:                NewQuotaTracker(clockFn),
 		GitHubAPIBase:         ghBase,
 		RawBase:               rawBase,
 	}
